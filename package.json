@@ -1,0 +1,26 @@
+{
+  "name": "chatto-music-bot",
+  "version": "0.1.0",
+  "description": "A music bot for Chatto voice calls: plays YouTube audio into calls over LiveKit",
+  "scripts": {
+    "start": "node --env-file=.env bot.mjs",
+    "check": "node --check bot.mjs"
+  },
+  "keywords": [
+    "chatto",
+    "music-bot",
+    "livekit",
+    "yt-dlp",
+    "voice"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@chatto/client": "^0.5.0-rc.5",
+    "@livekit/rtc-node": "^1.2.1"
+  },
+  "private": false,
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,11 @@
+# Generic docker compose setup. For Dokploy see "Deploying with Dokploy" in the README.
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - bot_data:/data
+
+volumes:
+  bot_data:
