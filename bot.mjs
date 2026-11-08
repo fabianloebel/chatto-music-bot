@@ -8,6 +8,7 @@ import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
+import { bestMatch, fmt, cut, table, card, parseTime, move, skipTo, shuffled } from './lib.mjs';
 const exec = promisify(execFile);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -25,19 +26,21 @@ const CFG = {
   REQUIRE_LISTENER: (env.REQUIRE_LISTENER ?? 'true') === 'true', // only people in the call may control playback
   AUTOJOIN_MS: Number(env.AUTOJOIN_MS ?? 60_000),
   DATA_FILE: env.DATA_FILE ?? '/data/state.json',
+  NORMALIZE: (env.NORMALIZE ?? 'true') === 'true',        // even out loudness between tracks
+  HEALTH_FILE: env.HEALTH_FILE ?? '/tmp/healthy',         // touched while connected; used by the Docker healthcheck
 };
 const RATE = 48000, FRAME = 480; // 10 ms frames
 const CH = (process.env.STEREO ?? 'true') === 'false' ? 1 : 2; // stereo by default; STEREO=false publishes mono
 const players = new Map(); // roomId -> Player
 
 // ---- persistence (saved queues + favorites), plain JSON on a Docker volume ----
-let state = { lists: {}, favs: {} };
+let state = { lists: {}, favs: {}, volumes: {}, resume: {} };
 try { state = { ...state, ...JSON.parse(fs.readFileSync(CFG.DATA_FILE, 'utf8')) }; } catch {}
 function save() {
   try { fs.mkdirSync(path.dirname(CFG.DATA_FILE), { recursive: true }); fs.writeFileSync(CFG.DATA_FILE, JSON.stringify(state)); }
   catch (e) { console.error('could not save state:', e.message); }
 }
-const slim = (t) => ({ title: t.title, dur: t.dur, secs: t.secs, url: t.url, id: t.id });
+const slim = (t) => ({ title: t.title, dur: t.dur, secs: t.secs, url: t.url, id: t.id, channel: t.channel });
 
 // ---- yt-dlp helpers (no shell; user input only ever passed as plain arguments) ----
 const PRINT = '%(title)s\t%(duration_string)s\t%(webpage_url,url)s\t%(duration)s\t%(id)s\t%(channel,uploader)s';
@@ -50,28 +53,10 @@ async function ytdlp(args) {
   return parseRows(stdout);
 }
 const target = (q) => (/^https?:\/\//.test(q) ? q : `ytsearch1:${q}`);
-// Plain-text searches prefer the studio version: skip live/cover/remix-style uploads unless the query asks for them.
-const UNWANTED = ['live', 'concert', 'cover', 'remix', 'karaoke', 'reaction', 'tutorial', 'slowed', 'reverb', 'sped up', '8d', 'nightcore', 'instrumental', 'acoustic', 'medley', 'mashup', 'compilation', 'full album', '1 hour', '10 hours', 'playlist'];
-const has = (text, w) => new RegExp(`(^|[^a-z0-9])${w}($|[^a-z0-9])`, 'i').test(text);
-function bestMatch(query, rows) {
-  const q = query.toLowerCase();
-  const bad = UNWANTED.filter((w) => !has(q, w));
-  const score = (r) => {
-    const t = r.title.toLowerCase();
-    let sc = 0;
-    if (/ - topic$/i.test(r.channel ?? '')) sc += 3;           // auto-generated album uploads
-    if (/official (audio|music video|video)|\(audio\)|\[audio\]/.test(t)) sc += 2;
-    if (r.secs == null && !has(q, 'live')) sc -= 10;             // live streams
-    if (r.secs != null && r.secs > CFG.MAX_TRACK_SEC) sc -= 10;
-    if (bad.some((w) => has(t, w))) sc -= 8;
-    return sc;
-  };
-  return rows.map((r, i) => ({ r, sc: score(r) - i * 0.1 })).sort((a, b) => b.sc - a.sc)[0]?.r;
-}
 const SMART_SEARCH = (env.SMART_SEARCH ?? 'true') === 'true';
 const resolveOne = async (q) => {
   if (SMART_SEARCH && !/^https?:\/\//.test(q)) {
-    const best = bestMatch(q, await ytdlp(['--flat-playlist', '--', `ytsearch8:${q}`]));
+    const best = bestMatch(q, await ytdlp(['--flat-playlist', '--', `ytsearch8:${q}`]), CFG.MAX_TRACK_SEC);
     if (best) return best;
   }
   return (await ytdlp(['--no-playlist', '--', target(q)]))[0];
@@ -79,30 +64,13 @@ const resolveOne = async (q) => {
 const resolveMany = (url, n) => ytdlp(['--flat-playlist', '--playlist-end', String(n), '--', url]);
 const search = (q, n = 5) => ytdlp(['--flat-playlist', '--', `ytsearch${n}:${q}`]);
 const related = (id) => ytdlp(['--flat-playlist', '--playlist-end', '20', '--', `https://www.youtube.com/watch?v=${id}&list=RD${id}`]);
-const fmt = (s) => (s == null ? 'live' : `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`);
-
-// ---- rich messages: headings, quotes and tables (Chatto has no embeds or buttons) ----
-const cut = (t, n) => { const a = Array.from(String(t ?? '')); return a.length > n ? a.slice(0, n - 1).join('') + '…' : a.join(''); };
-const md = (t) => String(t ?? '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
-function card(track, { elapsed = 0, volume = 100, loop = 'off', radio = false, paused = false, queued = 0 } = {}) {
-  const channel = track.channel && track.channel !== 'NA' ? track.channel : null;
-  const bar = track.secs ? '▰'.repeat(Math.round(Math.min(1, elapsed / track.secs) * 16)).padEnd(16, '▱') : '▰'.repeat(16);
-  const tags = [`🔊 ${volume}%`, loop !== 'off' ? `🔁 ${loop}` : null, radio ? '📻 radio' : null, queued ? `⏭ ${queued} up next` : null].filter(Boolean).join('  ·  ');
-  return [
-    `### ${paused ? '⏸ Paused' : '🎵 Now playing'}`,
-    `**${cut(track.title, 90)}**${channel ? `  \n${cut(channel, 50)}` : ''}`,
-    `\`${bar}\`  ${track.secs ? `${fmt(elapsed)} / ${track.dur}` : '🔴 LIVE'}`,
-    `> ${tags}`,
-  ].join('\n\n');
-}
-const table = (head, rows) => [`| ${head.join(' | ')} |`, `|${head.map(() => '---').join('|')}|`, ...rows.map((r) => `| ${r.map(md).join(' | ')} |`)].join('\n');
 
 let failures = 0; // consecutive playback failures: a restart self-updates yt-dlp
 
 class Player {
   constructor(roomId, voice, notify) {
     Object.assign(this, { roomId, voice, notify, queue: [], current: null, history: [], loop: 'off', radio: false, paused: false,
-      volume: 100, votes: new Set(), sent: 0, ff: null, dl: null, room: null, running: false, abort: false, stopped: false,
+      volume: state.volumes[roomId] ?? 100, votes: new Set(), sent: 0, offset: 0, seekReq: null, ff: null, dl: null, room: null, running: false, abort: false, stopped: false,
       aloneTimer: null, idleTimer: null, lastSearch: [], gen: 0 });
   }
   // ---- call connection ----
@@ -145,17 +113,24 @@ class Player {
   async autoLeave(msg) { await this.leave(); players.delete(this.roomId); this.notify(this.roomId, msg).catch(() => {}); }
 
   // ---- queue / playback ----
-  add(items) { this.queue.push(...items); this.stopped = false; this.run(); }
+  add(items, front = false) { if (front) this.queue.unshift(...items); else this.queue.push(...items); this.stopped = false; this.run(); }
   async run() {
     if (this.running) return;
     this.running = true;
     try {
       while (this.room && !this.stopped) {
-        const item = await this.pick();
-        if (!item) { this.current = null; this.armIdle(); break; }
-        this.current = item; this.votes.clear(); clearTimeout(this.idleTimer);
-        if (!(this.loop === 'track' && this.history.at(-1)?.id === item.id)) this.notify(this.roomId, card(item, { volume: this.volume, loop: this.loop, radio: this.radio, queued: this.queue.length })).catch((e) => console.error('card failed:', e.message));
-        const result = await this.playOne(item);
+        let item, start = 0;
+        const seeking = this.seekReq != null && this.current;
+        if (seeking) { item = this.current; start = this.seekReq; this.seekReq = null; }
+        else {
+          item = await this.pick();
+          if (!item) { this.current = null; this.armIdle(); break; }
+          if (item.at) { start = item.at; item = { ...item }; delete item.at; } // resumed after a restart
+          this.current = item; this.votes.clear(); clearTimeout(this.idleTimer);
+        }
+        if (!seeking && start === 0 && !(this.loop === 'track' && this.history.at(-1)?.id === item.id)) this.notify(this.roomId, card(item, { volume: this.volume, loop: this.loop, radio: this.radio, queued: this.queue.length })).catch((e) => console.error('card failed:', e.message));
+        const result = await this.playOne(item, start);
+        if (this.seekReq != null && !this.stopped) continue; // seek / restart: play the same track again from the new position
         this.history.push(item); if (this.history.length > 30) this.history.shift();
         if (!this.stopped && result !== 'failed') {
           if (this.loop === 'track' && result === 'done') this.queue.unshift(item);
@@ -163,7 +138,7 @@ class Player {
         }
         if (result === 'failed') {
           this.notify(this.roomId, `Could not play **${item.title}**.`).catch(() => {});
-          if (++failures >= 3) { console.error('3 playback failures in a row, restarting to update yt-dlp'); this.notify(this.roomId, 'Playback keeps failing, restarting to update my downloader. Try again in a minute.').finally(() => process.exit(1)); return; }
+          if (++failures >= 3) { console.error('3 playback failures in a row, restarting to update yt-dlp'); state.resume = {}; save(); this.notify(this.roomId, 'Playback keeps failing, restarting to update my downloader. Try again in a minute.').finally(() => process.exit(1)); return; }
         } else failures = 0;
       }
     } finally { this.running = false; this.current = this.stopped ? null : this.current; }
@@ -180,12 +155,13 @@ class Player {
       return next ?? null;
     } catch (e) { console.error('radio failed:', e.message); return null; }
   }
-  async playOne(item) {
-    this.abort = false; this.sent = 0;
+  async playOne(item, start = 0) {
+    this.abort = false; this.sent = 0; this.offset = start;
     const gen = ++this.gen; // a newer playback invalidates every older one
     console.log(`[${this.roomId}] start: ${item.title}`);
     const dl = spawn('yt-dlp', ['-q', '--js-runtimes', 'node', '--no-playlist', '-f', 'bestaudio', '-o', '-', '--', item.url], { stdio: ['ignore', 'pipe', 'inherit'] });
-    const ff = spawn('ffmpeg', ['-loglevel', 'error', '-i', 'pipe:0', '-f', 's16le', '-ar', String(RATE), '-ac', String(CH), 'pipe:1'], { stdio: ['pipe', 'pipe', 'inherit'] });
+    const ff = spawn('ffmpeg', ['-loglevel', 'error', ...(start > 0 ? ['-ss', String(start)] : []), '-i', 'pipe:0',
+      ...(CFG.NORMALIZE ? ['-af', 'loudnorm=I=-16:TP=-1.5:LRA=11'] : []), '-f', 's16le', '-ar', String(RATE), '-ac', String(CH), 'pipe:1'], { stdio: ['pipe', 'pipe', 'inherit'] });
     dl.stdout.pipe(ff.stdin); dl.stdout.on('error', () => {}); ff.stdin.on('error', () => {});
     this.dl = dl; this.ff = ff; let buf = Buffer.alloc(0);
     try {
@@ -209,8 +185,15 @@ class Player {
     } catch (e) { console.error('playback error:', e.message); return this.sent ? 'aborted' : 'failed'; }
     finally { dl.kill('SIGKILL'); ff.kill('SIGKILL'); if (gen === this.gen) this.ff = this.dl = null; console.log(`[${this.roomId}] end: ${item.title} (${(this.sent / 100).toFixed(0)}s fed)`); }
   }
-  elapsed() { return this.sent / 100; }
-  skip() { this.abort = true; this.paused = false; this.ff?.kill('SIGKILL'); this.dl?.kill('SIGKILL'); this.source?.clearQueue?.(); }
+  elapsed() { return this.offset + this.sent / 100; }
+  seek(sec) { this.skip(); this.seekReq = Math.max(0, Math.floor(sec)); }
+  snapshot() {
+    const items = [this.current, ...this.queue].filter(Boolean).map(slim);
+    if (!items.length) return null;
+    if (this.current) items[0].at = Math.floor(this.elapsed() / 10) * 10;
+    return { t: Date.now(), items, volume: this.volume, loop: this.loop, radio: this.radio };
+  }
+  skip() { this.seekReq = null; this.abort = true; this.paused = false; this.ff?.kill('SIGKILL'); this.dl?.kill('SIGKILL'); this.source?.clearQueue?.(); }
   halt() { this.stopped = true; this.queue = []; this.skip(); }
   async leave() { this.halt(); await this.voice.leaveCall(this.roomId).catch(() => {}); this.room?.disconnect(); this.room = null; }
 }
@@ -231,7 +214,9 @@ async function say(ctx, text) {
 const react = (ctx, e) => ctx.addReaction(e).catch(() => {});
 process.on('unhandledRejection', (e) => console.error('unhandled rejection:', e?.message ?? e));
 process.on('uncaughtException', (e) => console.error('uncaught exception:', e?.message ?? e));
-async function shutdown() { await Promise.allSettled([...players.values()].map((p) => p.leave())); client.close(); process.exit(0); }
+let shuttingDown = false;
+async function shutdown() {
+  persistResume(); shuttingDown = true; await Promise.allSettled([...players.values()].map((p) => p.leave())); client.close(); process.exit(0); }
 process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
 
 // join every channel room the bot may join, so new rooms need no manual step
@@ -261,12 +246,43 @@ const HELP = [
     ['`playlist <url>` · `search <terms>` · `pick <n>`', 'Queue a whole playlist, or browse results and choose one'],
     ['`pause` · `resume` · `skip` · `stop`', 'Playback control (3+ listeners: skip is a vote)'],
     ['`nowplaying` · `queue` · `history`', 'See what is going on'],
+    ['`playnext <song>` · `skipto <n>` · `move <from> <to>`', 'Play a song right after this one, jump ahead, reorder'],
+    ['`seek 1:30` · `seek +30` · `restart`', 'Jump within the current track'],
     ['`shuffle` · `remove <n>` · `clear` · `replay [n]`', 'Manage the queue'],
     ['`loop off/track/queue` · `volume <0-100>` · `radio on/off`', 'Playback modes'],
     ['`save <name>` · `load <name>` · `lists` · `delete <name>`', 'Saved queues'],
     ['`fav` · `favs` · `playfavs`', 'Your personal favorites'],
   ]),
 ].join('\n');
+
+// ---- survive restarts: snapshot the queues, pick them up again on the next start ----
+let lastSnap = '';
+function persistResume() {
+  if (shuttingDown) return;
+  const r = {}; for (const [id, p] of players) { const sn = p.snapshot(); if (sn) r[id] = sn; }
+  const j = JSON.stringify(Object.values(r).map(({ t, ...x }) => x));
+  if (j === lastSnap) return;
+  lastSnap = j; state.resume = r; save();
+}
+setInterval(persistResume, 10_000);
+async function resumeAll() {
+  const saved = state.resume ?? {}; state.resume = {}; save(); // consumed up front, so a crash while resuming cannot loop
+  for (const [roomId, sn] of Object.entries(saved)) {
+    if (!sn?.items?.length || Date.now() - sn.t > 15 * 60_000) continue;
+    try {
+      const p = new Player(roomId, voice, notify); players.set(roomId, p);
+      await p.connect();
+      Object.assign(p, { volume: sn.volume ?? p.volume, loop: sn.loop ?? 'off', radio: !!sn.radio });
+      p.add(sn.items); console.log(`[${roomId}] resumed ${sn.items.length} tracks`);
+      notify(roomId, '🔄 Back online, picking up where I left off.').catch(() => {});
+    } catch (e) { players.delete(roomId); console.error(`could not resume ${roomId}: ${e.message}`); }
+  }
+}
+setTimeout(resumeAll, 5000);
+
+// ---- healthcheck: touch a file while the Chatto connection is up (see HEALTHCHECK in the Dockerfile) ----
+const beat = () => { if (!notReadySince) try { fs.writeFileSync(CFG.HEALTH_FILE, String(Date.now())); } catch {} };
+beat(); setInterval(beat, 15_000);
 
 const seen = new Set();
 console.log('music bot starting');
@@ -282,19 +298,19 @@ await server.run(async (ctx) => {
   const ensure = async () => { if (!p) players.set(roomId, (p = new Player(roomId, voice, notify))); await p.connect(); return p; };
   const room = (n) => `Queue full (max ${CFG.MAX_QUEUE}).`;
   const fits = (t) => t && t.url && (t.secs == null || t.secs <= CFG.MAX_TRACK_SEC);
-  const enqueue = async (items) => {
+  const enqueue = async (items, front = false) => {
     await ensure();
     const free = CFG.MAX_QUEUE - p.queue.length;
     if (free <= 0) return say(ctx, room());
     const ok = items.filter(fits).slice(0, free).map((t) => ({ ...t, by: who }));
     if (!ok.length) return say(ctx, `Nothing playable (tracks are limited to ${fmt(CFG.MAX_TRACK_SEC)}).`);
-    const was = p.current; p.add(ok);
+    const was = p.current; p.add(ok, front);
     await react(ctx, 'white_check_mark');
     const skipped = items.length - ok.length;
-    if (ok.length === 1) return was ? say(ctx, `> ➕ Queued **${ok[0].title}** · ${ok[0].dur} · position ${p.queue.length}`) : undefined;
+    if (ok.length === 1) return was ? say(ctx, `> ➕ Queued **${ok[0].title}** · ${ok[0].dur} · position ${front ? 1 : p.queue.length}`) : undefined;
     return say(ctx, `> ➕ Queued **${ok.length} tracks**${skipped ? ` · ${skipped} skipped (too long or queue full)` : ''}`);
   };
-  const playerCmds = new Set(['pause', 'resume', 'skip', 'stop', 'leave', 'shuffle', 'remove', 'clear', 'loop', 'volume', 'vol', 'radio', 'replay', 'play', 'p', 'playlist', 'pick', 'load', 'playfavs']);
+  const playerCmds = new Set(['pause', 'resume', 'skip', 'stop', 'leave', 'shuffle', 'remove', 'clear', 'loop', 'volume', 'vol', 'radio', 'replay', 'play', 'p', 'playlist', 'pick', 'load', 'playfavs', 'playnext', 'pn', 'seek', 'restart', 'skipto', 'move']);
   try {
     if (!cmd || cmd === 'help' || cmd === 'h') return void (await say(ctx, HELP));
     if (p && playerCmds.has(cmd) && !p.isListener(who)) return void (await say(ctx, 'Join the call first, then I will take your commands.'));
@@ -305,6 +321,12 @@ await server.run(async (ctx) => {
         const t = await resolveOne(arg);
         if (!t) return void (await say(ctx, 'Found nothing.'));
         return void (await enqueue([t]));
+      }
+      case 'playnext': case 'pn': {
+        if (!arg) return void (await say(ctx, 'Usage: `playnext <url or search terms>`'));
+        const t = await resolveOne(arg);
+        if (!t) return void (await say(ctx, 'Found nothing.'));
+        return void (await enqueue([t], true));
       }
       case 'playlist': {
         if (!/^https?:\/\//.test(arg)) return void (await say(ctx, 'Usage: `playlist <playlist url>`'));
@@ -332,6 +354,25 @@ await server.run(async (ctx) => {
         if (p.votes.size >= need) { p.skip(); return void (await say(ctx, 'Skipped by vote.')); }
         return void (await say(ctx, `Skip vote ${p.votes.size}/${need}.`));
       }
+      case 'seek': case 'restart': {
+        if (!p?.current) return void (await say(ctx, 'Nothing playing.'));
+        if (!p.current.secs) return void (await say(ctx, 'Cannot seek in a live stream.'));
+        const t = cmd === 'restart' ? { sec: 0, relative: false } : parseTime(arg);
+        if (!t) return void (await say(ctx, 'Usage: `seek 1:30` · `seek +30` · `seek -15` · `restart`'));
+        const to = Math.min(Math.max(0, t.relative ? p.elapsed() + t.sec : t.sec), p.current.secs - 1);
+        p.seek(to); return void (await say(ctx, `> ⏩ ${cmd === 'restart' ? 'Restarting the track' : `Jumped to **${fmt(to)}**`} / ${p.current.dur}`));
+      }
+      case 'skipto': {
+        const r = p && skipTo(p.queue, Number(arg));
+        if (!r) return void (await say(ctx, 'Usage: `skipto <queue number>`'));
+        p.queue = r.queue; p.skip(); return void (await say(ctx, `> ⏭ Skipping to **${r.queue[0].title}**`));
+      }
+      case 'move': {
+        const [a, b] = arg.split(/\s+/).map(Number);
+        const r = p && move(p.queue, a, b);
+        if (!r) return void (await say(ctx, 'Usage: `move <from> <to>` (queue numbers)'));
+        p.queue = r.queue; return void (await say(ctx, `> ↕️ Moved **${r.track.title}** to position ${b}`));
+      }
       case 'stop': case 'leave': if (!p) return void (await say(ctx, 'Not in a call.')); await p.leave(); players.delete(roomId); return void (await say(ctx, 'Bye!'));
       case 'queue': case 'q': {
         if (!p?.current && !p?.queue.length) return void (await say(ctx, 'Queue is empty.'));
@@ -349,7 +390,7 @@ await server.run(async (ctx) => {
         if (!p) return void (await say(ctx, 'Not in a call.'));
         if (arg === '') return void (await say(ctx, `Volume is ${p.volume}%.`));
         const v = Number(arg); if (!Number.isFinite(v) || v < 0 || v > 100) return void (await say(ctx, 'Usage: `volume <0-100>`'));
-        p.volume = Math.round(v); return void (await say(ctx, `Volume ${p.volume}%.`));
+        p.volume = Math.round(v); state.volumes[roomId] = p.volume; save(); return void (await say(ctx, `Volume ${p.volume}%.`));
       }
       case 'loop': {
         if (!p) return void (await say(ctx, 'Not in a call.'));
@@ -358,7 +399,7 @@ await server.run(async (ctx) => {
       }
       case 'shuffle': {
         if (!p?.queue.length) return void (await say(ctx, 'Queue is empty.'));
-        for (let i = p.queue.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [p.queue[i], p.queue[j]] = [p.queue[j], p.queue[i]]; }
+        p.queue = shuffled(p.queue);
         return void (await say(ctx, 'Shuffled.'));
       }
       case 'remove': {

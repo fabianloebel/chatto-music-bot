@@ -14,9 +14,12 @@ loop, radio mode, saved playlists and more. It works with Chatto's end-to-end en
 
 - 🎧 Plays into the call of the room where you wrote the command, one player per room
 - 🔎 Smart search: prefers studio versions over live, cover, remix, nightcore… uploads (ask for them by naming them)
-- 📃 Queue, playlists (`playlist <url>`), search results with `pick`, shuffle, remove, clear
+- 📃 Queue, playlists (`playlist <url>`), search results with `pick`, `playnext`, `skipto`, `move`, shuffle, remove, clear
+- ⏩ `seek 1:30` / `seek +30` / `restart` inside the current track
 - 🔁 Loop a track or the whole queue, 📻 radio mode keeps playing similar songs, 🕘 history and `replay`
 - ⏸ Pause/resume, 🔊 volume, ⏭ skip with a majority vote when 3+ people listen
+- 🔊 Stereo audio, loudness normalization between tracks, volume remembered per room
+- 🔄 Picks the queue up again after a restart or redeploy (including the position in the current track)
 - 💾 Saved queues and ⭐ per-user favorites, stored in a small JSON file
 - 🚪 Joins new rooms automatically, leaves when everyone left or after being idle
 - 🔒 Only people in the call can control playback; per-track length and queue limits
@@ -34,6 +37,9 @@ Mention the bot, then the command, for example `@MusicBot play daft punk one mor
 | `search <terms>` / `pick <n>` | Show 5 results, then queue one |
 | `pause` / `resume` / `skip` / `stop` | Playback control. `stop` clears the queue and leaves the call |
 | `nowplaying` / `queue` / `history` | Show what is going on |
+| `playnext <song>` | Queue a song right after the current one |
+| `skipto <n>` / `move <from> <to>` | Jump ahead in the queue, reorder it |
+| `seek <time>` / `restart` | Jump within the track: `seek 1:30`, `seek +30`, `seek -15` |
 | `shuffle` / `remove <n>` / `clear` / `replay [n]` | Manage the queue |
 | `loop off\|track\|queue` / `volume <0-100>` / `radio on\|off` | Playback modes |
 | `save <name>` / `load <name>` / `lists` / `delete <name>` | Saved queues (shared per server) |
@@ -61,12 +67,13 @@ A call has to be running in the room before the bot can join it.
 
 ### 2. Run it
 
-Requirements: Node.js 22+, `ffmpeg` and `yt-dlp` on the `PATH`, or just use Docker.
+Requirements: Node.js 22+ (the image uses the current LTS), `ffmpeg` and `yt-dlp` on the `PATH`, or just use Docker.
 
 ```bash
 cp .env.example .env     # fill in CHATTO_BOT_TOKEN, CHATTO_URL, LIVEKIT_URL
 npm ci
 npm start                # runs: node --env-file=.env bot.mjs
+npm test                 # unit tests (node:test)
 ```
 
 With Docker:
@@ -80,29 +87,10 @@ The image bundles ffmpeg and yt-dlp, updates yt-dlp at every start and keeps sav
 
 ### Deploying with Dokploy
 
-Create a **Compose** service (source: Raw) and add the project files as **File Mounts** (`Dockerfile`, `package.json`,
-`package-lock.json`, `bot.mjs`). Use this compose file, with `../files` pointing at the mounted files, and set the three
-variables in the **Environment** tab:
-
-```yaml
-services:
-  bot:
-    build:
-      context: ../files
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    environment:
-      CHATTO_BOT_TOKEN: ${CHATTO_BOT_TOKEN}
-      CHATTO_URL: ${CHATTO_URL}
-      LIVEKIT_URL: ${LIVEKIT_URL}
-    volumes:
-      - bot_data:/data
-
-volumes:
-  bot_data:
-```
-
-No ports or domains are needed: the bot only makes outbound connections (Chatto API, and WebRTC to your LiveKit).
+Create a **Compose** service with source **Git**: repository URL of this project (or your fork), branch `main`, compose
+path `./compose.yml`. Set `CHATTO_BOT_TOKEN`, `CHATTO_URL` and `LIVEKIT_URL` in the **Environment** tab (Dokploy writes them
+to the `.env` file that `compose.yml` reads). Deploy. To update, press **Deploy** again: it pulls the latest commit and
+rebuilds. No ports or domains are needed, the bot only makes outbound connections (Chatto API, and WebRTC to your LiveKit).
 
 ## Configuration
 
@@ -116,7 +104,9 @@ Required: `CHATTO_BOT_TOKEN`, `CHATTO_URL`, `LIVEKIT_URL`. Optional settings, al
 | `MAX_QUEUE` | `50` | maximum queue length per room |
 | `REQUIRE_LISTENER` | `true` | only people in the call may control playback |
 | `SMART_SEARCH` | `true` | prefer studio versions in text searches |
+| `NORMALIZE` | `true` | even out loudness between tracks (ffmpeg `loudnorm`) |
 | `STEREO` | `true` | publish stereo audio; `false` sends mono |
+| `HEALTH_FILE` | `/tmp/healthy` | file touched while connected, read by the Docker `HEALTHCHECK` |
 | `AUTOJOIN_MS` | `60000` | how often to look for new rooms to join |
 | `DATA_FILE` | `/data/state.json` | where saved queues and favorites live |
 
@@ -126,8 +116,9 @@ Required: `CHATTO_BOT_TOKEN`, `CHATTO_URL`, `LIVEKIT_URL`. Optional settings, al
 2. For `play`, the bot resolves the song with `yt-dlp`, then calls `JoinCall` and `CreateCallToken` to get a LiveKit token
    and the call's shared encryption key.
 3. It connects with `@livekit/rtc-node` using that key (end-to-end encrypted) and publishes one microphone track.
-4. Audio flows `yt-dlp → ffmpeg (48 kHz mono PCM) → LiveKit` in 10 ms frames. Volume, pause and skip act on that stream.
-5. Rich replies are plain Markdown (headings, tables, quotes, emoji), since Chatto has no embeds or buttons.
+4. Audio flows `yt-dlp → ffmpeg (48 kHz stereo PCM, loudness-normalized) → LiveKit` in 10 ms frames. Volume, pause, skip and seek act on that stream.
+5. Every 10 s the queues are written to the state file, so a restart resumes them (only if a call is still running).
+6. Rich replies are plain Markdown (headings, tables, quotes, emoji), since Chatto has no embeds or buttons.
 
 ## Troubleshooting
 

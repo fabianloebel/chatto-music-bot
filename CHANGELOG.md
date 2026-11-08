@@ -1,8 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
-- Stereo audio by default (`STEREO=false` for mono)
+- New commands: `playnext`, `skipto`, `move`, `seek`, `restart`
+- Queue and position survive restarts and redeploys
+- Loudness normalization (`NORMALIZE=false` to disable) and stereo audio (`STEREO=false` for mono)
+- Volume is remembered per room
+- Search: words in the query such as "live" or "remix" now favour matching uploads
+- Docker healthcheck, Node 26 (LTS) image
+- Pure helpers moved to `lib.mjs`, unit tests with `npm test`, CI runs on Node 22 and 26
 
 ## 0.1.0 – initial release
 
