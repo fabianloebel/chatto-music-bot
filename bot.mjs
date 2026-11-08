@@ -26,7 +26,8 @@ const CFG = {
   AUTOJOIN_MS: Number(env.AUTOJOIN_MS ?? 60_000),
   DATA_FILE: env.DATA_FILE ?? '/data/state.json',
 };
-const RATE = 48000, CH = 1, FRAME = 480; // 10 ms mono frames
+const RATE = 48000, FRAME = 480; // 10 ms frames
+const CH = (process.env.STEREO ?? 'true') === 'false' ? 1 : 2; // stereo by default; STEREO=false publishes mono
 const players = new Map(); // roomId -> Player
 
 // ---- persistence (saved queues + favorites), plain JSON on a Docker volume ----
@@ -190,12 +191,12 @@ class Player {
     try {
       for await (const chunk of ff.stdout) {
         buf = Buffer.concat([buf, chunk]);
-        while (buf.length >= FRAME * 2) {
+        while (buf.length >= FRAME * CH * 2) {
           while (this.paused && !this.abort) await sleep(100);
           if (this.abort || gen !== this.gen) return 'aborted';
-          const f = new Int16Array(FRAME), vol = this.volume / 100;
-          for (let i = 0; i < FRAME; i++) f[i] = Math.max(-32768, Math.min(32767, Math.round(buf.readInt16LE(i * 2) * vol)));
-          buf = buf.subarray(FRAME * 2);
+          const f = new Int16Array(FRAME * CH), vol = this.volume / 100;
+          for (let i = 0; i < FRAME * CH; i++) f[i] = Math.max(-32768, Math.min(32767, Math.round(buf.readInt16LE(i * 2) * vol)));
+          buf = buf.subarray(FRAME * CH * 2);
           if (gen !== this.gen) return 'aborted';
           await this.source.captureFrame(new AudioFrame(f, RATE, CH, FRAME));
           this.sent++;

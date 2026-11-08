@@ -116,6 +116,7 @@ Required: `CHATTO_BOT_TOKEN`, `CHATTO_URL`, `LIVEKIT_URL`. Optional settings, al
 | `MAX_QUEUE` | `50` | maximum queue length per room |
 | `REQUIRE_LISTENER` | `true` | only people in the call may control playback |
 | `SMART_SEARCH` | `true` | prefer studio versions in text searches |
+| `STEREO` | `true` | publish stereo audio; `false` sends mono |
 | `AUTOJOIN_MS` | `60000` | how often to look for new rooms to join |
 | `DATA_FILE` | `/data/state.json` | where saved queues and favorites live |
 

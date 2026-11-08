@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Stereo audio by default (`STEREO=false` for mono)
+
 ## 0.1.0 – initial release
 
 - Voice playback into Chatto calls (LiveKit, end-to-end encrypted calls supported)
