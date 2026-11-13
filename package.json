@@ -17,7 +17,7 @@
   "license": "MIT",
   "type": "module",
   "dependencies": {
-    "@chatto/client": "^0.5.0-rc.5",
+    "@chatto/client": "^0.5.0",
     "@livekit/rtc-node": "^1.2.1"
   },
   "private": false,
